@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">AsyncTaskApp</string>
+    <string name="title_activity_async_task">Map</string>
+    <string name="title_activity_maps">Map</string>
+</resources>
