@@ -5,8 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentSender;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
+import android.hardware.Camera;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -21,7 +20,9 @@ import android.os.Bundle;
 import android.support.v4.content.ContextCompat;
 import android.util.Log;
 import android.view.View;
+import android.widget.ImageButton;
 import android.widget.ImageView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import com.google.android.gms.common.ConnectionResult;
@@ -45,27 +46,42 @@ import com.google.android.gms.maps.model.LatLng;
 import com.google.android.gms.maps.model.Marker;
 import com.google.android.gms.maps.model.MarkerOptions;
 
-import java.net.URL;
-import java.util.ArrayList;
+import java.sql.Time;
+import java.util.LinkedList;
 
 public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCallback,
         GoogleApiClient.ConnectionCallbacks, GoogleApiClient.OnConnectionFailedListener,
         LocationListener,SensorEventListener{
 
+    private static final String TAG = "AsyncTaskActivity: ";
     private GoogleMap mMap;
     GoogleApiClient mGoogleApiClient;
     LocationRequest mLocationRequest;
     Location mCurrentLocation;
     float illuminance;
-    boolean locationSettingsOk;
+    boolean isLocationSettingsOk;
     protected static final int LOCATION_REQUEST_CODE = 1;
     protected static final int SETTINGS_CHECK_REQUEST_CODE = 2;
-    private Marker marker;
+    public static final float TWENTY_FIVE_DEGREE_IN_RADIAN = 0.436332313f;
+    public static final float ONE_FIFTY_FIVE_DEGREE_IN_RADIAN = 2.7052603f;
+    private LinkedList<Float> mCompassHistory = new LinkedList<Float>();
+    private float[] mCompassHistorySum = new float[]{0.0f, 0.0f};
+    private int mHistoryMaxLength;
+    private Marker currentLocationMarker;
     ShowLocationOnMapTask mapLocAsyncTask;
-    private ArrayList<LatLng> traveledRoad;
-    public static final String EXTRA_MESSAGE_ROAD_TRAVELED = "com.example.pawe.asyntaskapp.ROAD_TRAVELED";
     private SensorManager mSensorManager;
     private Sensor mLight;
+    private Sensor mGravity;
+    private Sensor mMagneticField;
+    private Sensor mGyroscope;
+    private float[] mGravityReading;
+    private float[] mMagnetometerReading;
+    private float[] mRotationMatrix = new float[9];
+    private final float[] mOrientationAngles = new float[3];
+    private float mCurrentDegree = 0f;
+    private boolean isFlashOn;
+    public static Camera camera;
+    private long lastGyroscopeUpdateTime;
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -83,6 +99,21 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
         }
         mSensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         mLight = mSensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+        mGravity = mSensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY);
+        mMagneticField = mSensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+        mGyroscope = mSensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+        if( this.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)) {
+            ImageButton imageButtonFlash = (ImageButton) findViewById(R.id.imageButtonLightBulb);
+            imageButtonFlash.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    switchFlashlightOnClick(v);
+                }
+            });
+            isFlashOn = false;
+            mHistoryMaxLength = 20;
+            lastGyroscopeUpdateTime = System.currentTimeMillis();
+        }
     }
 
     @Override
@@ -102,23 +133,23 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
                 final LocationSettingsStates r = locationSettingsResult.getLocationSettingsStates();
                 switch (status.getStatusCode()) {
                     case LocationSettingsStatusCodes.SUCCESS: {
-                        locationSettingsOk = true;
-                        Log.d("onResult","result ok");
+                        isLocationSettingsOk = true;
+                        Log.d(TAG,"onResult: result ok");
                         break;
                     }
                     case LocationSettingsStatusCodes.RESOLUTION_REQUIRED:
                         try {
-                            Log.d("onResult","result resolution required");
+                            Log.d(TAG,"onResult: result resolution required");
                             status.startResolutionForResult(
                                     AsyncTaskActivity.this,SETTINGS_CHECK_REQUEST_CODE
                             );
 
                         } catch (IntentSender.SendIntentException e){
-
+                            Log.e(TAG,"onResult: exception " + e.toString());
                         }
                         break;
                     case LocationSettingsStatusCodes.SETTINGS_CHANGE_UNAVAILABLE: {
-                        Log.d("onResult","result change unavailable");
+                        Log.d(TAG,"onResult: result change unavailable");
                         break;
                     }
                     default:{
@@ -133,6 +164,12 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
     protected void onStop() {
         super.onStop();
         mGoogleApiClient.disconnect();
+        try{
+            stopLocationUpdates();
+        }catch (IllegalStateException e){
+            Log.e(TAG,"onStop: exception " + e.toString());
+
+        }
     }
 
     @Override
@@ -140,13 +177,12 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
         super.onPause();
         mSensorManager.unregisterListener(this);
         try{
-            stopLocationUpdates();
-            if(mapLocAsyncTask != null)
-            {
-                mapLocAsyncTask.execute();
+            if (currentLocationMarker != null) {
+                currentLocationMarker.remove();
             }
+            stopLocationUpdates();
         }catch (IllegalStateException e){
-
+            Log.e(TAG,"onStop: exception " + e.toString());
         }
 
     }
@@ -154,8 +190,12 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
     @Override
     protected void onResume() {
         super.onResume();
-        mSensorManager.registerListener(this, mLight, SensorManager.SENSOR_DELAY_NORMAL);
-
+        mSensorManager.registerListener(this, mLight, SensorManager.SENSOR_DELAY_FASTEST);
+        mSensorManager.registerListener(this, mGravity,
+                SensorManager.SENSOR_DELAY_NORMAL, SensorManager.SENSOR_DELAY_UI);
+        mSensorManager.registerListener(this,mMagneticField,
+                SensorManager.SENSOR_DELAY_NORMAL,SensorManager.SENSOR_DELAY_UI);
+        mSensorManager.registerListener(this,mGyroscope,500000000,500000000);
         try{
             startLocationsUpdates();
             if(mapLocAsyncTask != null)
@@ -163,7 +203,7 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
                 mapLocAsyncTask.execute();
             }
         }catch (IllegalStateException e){
-
+            Log.e(TAG,"onResume: exception " + e.toString());
         }
 
     }
@@ -173,14 +213,14 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
         mMap = googleMap;
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
                 == PackageManager.PERMISSION_GRANTED){
-            locationSettingsOk = true;
-            Log.d("mapReady","permission ok");
+            isLocationSettingsOk = true;
+            Log.d(TAG,"onMapReady: permission ok");
         }
-        else{
-            locationSettingsOk = false;
+        else {
+            isLocationSettingsOk = false;
             ActivityCompat.requestPermissions(this,
                     new String[]{Manifest.permission.ACCESS_FINE_LOCATION},LOCATION_REQUEST_CODE);
-            Log.d("mapReady","requestPermissions");
+            Log.d(TAG,"onMapReady: requestPermissions");
         }
     }
 
@@ -189,13 +229,12 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
         switch (requestCode) {
             case SETTINGS_CHECK_REQUEST_CODE: {
                 if(resultCode == RESULT_OK) {
-                    locationSettingsOk = true;
-                    Log.d("activityResult","ok");
+                    isLocationSettingsOk = true;
+                    Log.d(TAG,"onActivityResult: ok");
                 }
                 else {
-                    locationSettingsOk = false;
-                    Log.d("activityResult","not ok");
-                    Toast.makeText(this, "ActivityResult not ok", Toast.LENGTH_SHORT).show();
+                    isLocationSettingsOk = false;
+                    Log.d(TAG, "onActivityResult: not ok");
                 }
                 break;
             }
@@ -209,26 +248,30 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
         switch (requestCode) {
             case LOCATION_REQUEST_CODE: {
                 if(grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED){
-                    locationSettingsOk = true;
-                    Log.d("requestPermissionResult","ok");
+                    isLocationSettingsOk = true;
+                    Log.d(TAG,"onRequestPermissionsResult: ok");
                 }
                 else{
-                    locationSettingsOk = false;
+                    isLocationSettingsOk = false;
                     Toast.makeText(this, "Permission denied. Location is unavailable",
                             Toast.LENGTH_SHORT).show();
-                    Log.d("requestPermissionResult","not ok");
+                    Log.d(TAG, "onRequestPermissionsResult: not ok");
                 }
             }
         }
     }
 
     protected void startLocationsUpdates() {
-        LocationServices.FusedLocationApi.requestLocationUpdates(mGoogleApiClient,
-                mLocationRequest,this);
+        if (mGoogleApiClient.isConnected()) {
+            LocationServices.FusedLocationApi.requestLocationUpdates(mGoogleApiClient,
+                    mLocationRequest,this);
+        }
     }
 
-    protected void stopLocationUpdates() {
-        LocationServices.FusedLocationApi.removeLocationUpdates(mGoogleApiClient,this);
+    protected void stopLocationUpdates() throws IllegalStateException{
+        if (mGoogleApiClient.isConnected()) {
+            LocationServices.FusedLocationApi.removeLocationUpdates(mGoogleApiClient,this);
+        }
     }
 
     protected void createLocationRequest()
@@ -241,101 +284,121 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
 
     @Override
     public void onConnected(@Nullable Bundle bundle) {
-        if (locationSettingsOk) {
+        if (isLocationSettingsOk) {
             mCurrentLocation = LocationServices.FusedLocationApi.getLastLocation(mGoogleApiClient);
             if(mCurrentLocation != null) {
-                LatLng ll = new LatLng(mCurrentLocation.getLatitude(), mCurrentLocation.getLongitude());
-                MarkerOptions markerO = new MarkerOptions().position(ll);
-                marker = mMap.addMarker(markerO);
+                LatLng latLng = new LatLng(mCurrentLocation.getLatitude(), mCurrentLocation.getLongitude());
+                MarkerOptions markerO = new MarkerOptions().position(latLng);
+                currentLocationMarker = mMap.addMarker(markerO);
+                CameraPosition cameraposition = new CameraPosition.Builder()
+                        .target(latLng)
+                        .zoom(15)
+                        .build();
+                mMap.moveCamera(CameraUpdateFactory.newCameraPosition(cameraposition));
                 startLocationsUpdates();
-                traveledRoad = new ArrayList<>();
-                traveledRoad.add(ll);
                 if(mapLocAsyncTask == null) {
-                    Log.d("newAsync","nnn");
+                    Log.d(TAG, "onConnected: create new Async Task");
                     mapLocAsyncTask = new ShowLocationOnMapTask();
                     mapLocAsyncTask.execute();
                 }
             }
+            startLocationsUpdates();
         }
 
 
+    }
+
+    private void putMyLocationMarkerOnMap(LatLng latLng){
+        if (currentLocationMarker != null) {
+            currentLocationMarker.remove();
+        }
+        currentLocationMarker = mMap.addMarker(new MarkerOptions()
+                .position(latLng));
+        currentLocationMarker.setTitle("Moja lokalizacja");
     }
 
     public void showMapActivity(View view) {
         Intent intent = new Intent(AsyncTaskActivity.this,MapsActivity.class);
-        intent.putParcelableArrayListExtra(EXTRA_MESSAGE_ROAD_TRAVELED,traveledRoad);
         startActivity(intent);
     }
 
-
-    private class ShowLocationOnMapTask extends AsyncTask<Void,String,Void> {
-
-        @Override
-        protected Void doInBackground(Void... params) {
-            String myLocationFromAsync;
-            int i = 0;
-            int check = 100000;
-            while (true) {
-                i++;
-                if(i==check) {
-                    i=0;
-                    Location l = LocationServices.FusedLocationApi.getLastLocation(mGoogleApiClient);
-                    //Log.d("async", "doInB"+l.toString());
-                    if(l != null)
-                    {
-                        myLocationFromAsync = new LatLng(l.getLatitude(),l.getLongitude()).toString();
-                        publishProgress(myLocationFromAsync);
-                    }
-                }
-                if(isCancelled()) {
-                    break;
-                }
+    public void switchFlashlightOnClick(View view) {
+        ImageButton imageButtonFlash = (ImageButton) findViewById(R.id.imageButtonLightBulb);
+        if (!isFlashOn) {
+            try {
+                camera = Camera.open();
+                Camera.Parameters p = camera.getParameters();
+                p.setFlashMode(Camera.Parameters.FLASH_MODE_TORCH);
+                camera.setParameters(p);
+                camera.startPreview();
+                imageButtonFlash.setImageResource(R.drawable.light_bulb_256_on);
+                isFlashOn = true;
+            } catch (RuntimeException e) {
+                Log.e(TAG, "switchFlashlightOnClick: exception " + e.toString());
             }
-            return null;
-        }
-
-        @Override
-        protected void onProgressUpdate(String... value) {
-            String pom = value[0].toString();
-            pom = pom.replace("(","");
-            pom = pom.replace(")","");
-            pom = pom.replace("lat/lng: ","");
-            //Log.d("aaaa",pom);
-            String[] s = pom.split(",");
-            LatLng latlng = new LatLng(Double.parseDouble(s[0]),Double.parseDouble(s[1]));
-           //Log.d("aaaa",latlng.toString());
-            marker.setPosition(latlng);
-            //Log.d("progress", "update");
-        }
-
-        @Override
-        protected void onPostExecute(Void aVoid) {
-            Log.d("post", "execute");
-            Toast.makeText(AsyncTaskActivity.this, "AsyncTask Map Location Completed", Toast.LENGTH_SHORT).show();
+        } else {
+            try {
+                Camera.Parameters p = camera.getParameters();
+                p.setFlashMode(Camera.Parameters.FLASH_MODE_OFF);
+                camera.setParameters(p);
+                camera.stopPreview();
+                camera.release();
+                imageButtonFlash.setImageResource(R.drawable.light_bulb_256_off);
+                isFlashOn = false;
+            } catch (RuntimeException e) {
+                Log.e(TAG, "switchFlashlightOnClick: exception " + e.toString());
+            }
         }
     }
+
     @Override
     public void onLocationChanged(Location location) {
         try {
+            Log.e(TAG,"onLocationChanged: location = " + String.valueOf(location.getLatitude() +
+                    " , " + String.valueOf(location.getLongitude())));
             mCurrentLocation = location;
-            LatLng latlng;
-            traveledRoad.add(latlng = new LatLng(mCurrentLocation.getLatitude(), mCurrentLocation.getLongitude()));
+            LatLng latLng;
+            latLng = new LatLng(mCurrentLocation.getLatitude(), mCurrentLocation.getLongitude());
             CameraPosition cameraposition = new CameraPosition.Builder()
-                    .target(latlng)
+                    .target(latLng)
                     .zoom(15)
                     .build();
             mMap.moveCamera(CameraUpdateFactory.newCameraPosition(cameraposition));
+            putMyLocationMarkerOnMap(latLng);
         }catch (NullPointerException e){
-
+            Log.e(TAG,"onLocationChanged: exception " + e.toString());
     }
 
     }
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        illuminance = event.values[0];
-        Log.d("illum",Float.toString(illuminance));
-        setIlluminanceBar(illuminance);
+        if (event.sensor == mLight) {
+            illuminance = event.values[0];
+            //Log.d("illum", Float.toString(illuminance));
+            setIlluminanceBar(illuminance);
+        }
+        else if(event.sensor == mGravity) {
+            mGravityReading = event.values.clone();
+            updateOrientationAngles();
+        }
+        else if(event.sensor == mMagneticField) {
+            mMagnetometerReading = event.values.clone();
+            updateOrientationAngles();
+        }
+        else if(event.sensor == mGyroscope) {
+            long eventTime = event.timestamp;
+            if (eventTime - lastGyroscopeUpdateTime > 1000000000L) {
+                String sensorDataString = "x axis: " + String.valueOf(event.values[0]) +
+                        "\n y axis: " + String.valueOf(event.values[1]) +
+                        "\n z axis: " + String.valueOf(event.values[2]);
+                Log.d(TAG, "onSensorChanged: " + sensorDataString);
+                TextView textView = (TextView) findViewById(R.id.textViewGyroscope);
+                textView.setText(sensorDataString);
+                lastGyroscopeUpdateTime = eventTime;
+            }
+        }
+
     }
     private void setIlluminanceBar(float level){
         ImageView ivBar = (ImageView) findViewById(R.id.brightnessBar);
@@ -377,6 +440,56 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
             ivBar.setImageResource(R.drawable.bar_8);
         }
     }
+
+    public void updateOrientationAngles() {
+        if (mMagnetometerReading != null && mGravityReading != null) {
+            SensorManager.getRotationMatrix(mRotationMatrix, null,
+                    mGravityReading, mMagnetometerReading);
+            float inclination = (float) Math.acos(mRotationMatrix[8]);
+            if (inclination < TWENTY_FIVE_DEGREE_IN_RADIAN
+                    || inclination > ONE_FIFTY_FIVE_DEGREE_IN_RADIAN)
+            {
+                SensorManager.getOrientation(mRotationMatrix, mOrientationAngles);
+                mCompassHistory.add(mOrientationAngles[0]);
+                mOrientationAngles[0] = calculateAverageAngle();
+            }
+            else
+            {
+                mOrientationAngles[0] = Float.NaN;
+                clearCompassHistory();
+            }
+            float azimuthInDegrees = (float)Math.toDegrees(mOrientationAngles[0]);
+            ImageView imageView = (ImageView) findViewById(R.id.compass);
+            imageView.setRotation( -azimuthInDegrees);
+           // Log.d("compass", Float.toString((float) Math.toDegrees(mOrientationAngles[0])));
+        }
+    }
+
+
+    private void clearCompassHistory()
+    {
+        mCompassHistorySum[0] = 0;
+        mCompassHistorySum[1] = 0;
+        mCompassHistory.clear();
+    }
+
+    public float calculateAverageAngle()
+    {
+        int totalTerms = mCompassHistory.size();
+        if (totalTerms > mHistoryMaxLength)
+        {
+            float firstTerm = mCompassHistory.removeFirst();
+            mCompassHistorySum[0] -= Math.sin(firstTerm);
+            mCompassHistorySum[1] -= Math.cos(firstTerm);
+            totalTerms -= 1;
+        }
+        float lastTerm = mCompassHistory.getLast();
+        mCompassHistorySum[0] += Math.sin(lastTerm);
+        mCompassHistorySum[1] += Math.cos(lastTerm);
+        float angle = (float) Math.atan2(mCompassHistorySum[0] / totalTerms, mCompassHistorySum[1] / totalTerms);
+
+        return angle;
+    }
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {
 
@@ -391,6 +504,48 @@ public class AsyncTaskActivity extends FragmentActivity implements OnMapReadyCal
     public void onConnectionFailed(@NonNull ConnectionResult connectionResult) {
 
     }
+    private class ShowLocationOnMapTask extends AsyncTask<Void,String,Void> {
 
+        @Override
+        protected Void doInBackground(Void... params) {
+            String myLocationFromAsync;
+            int i = 0;
+            int check = 100000;
+            while (true) {
+                i++;
+                if(i==check) {
+                    i=0;
+                    Location l = LocationServices.FusedLocationApi.getLastLocation(mGoogleApiClient);
+                    //Log.d("async", "doInB"+l.toString());
+                    if(l != null)
+                    {
+                        myLocationFromAsync = new LatLng(l.getLatitude(),l.getLongitude()).toString();
+                        publishProgress(myLocationFromAsync);
+                    }
+                }
+                if(isCancelled()) {
+                    break;
+                }
+            }
+            return null;
+        }
+
+        @Override
+        protected void onProgressUpdate(String... value) {
+            String pom = value[0];
+            pom = pom.replace("(","");
+            pom = pom.replace(")","");
+            pom = pom.replace("lat/lng: ","");
+            String[] s = pom.split(",");
+            LatLng latlng = new LatLng(Double.parseDouble(s[0]),Double.parseDouble(s[1]));
+            //putMyLocationMarkerOnMap(latlng);
+        }
+
+        @Override
+        protected void onPostExecute(Void aVoid) {
+            Log.d(TAG,"onPostExecute: execute");
+            Toast.makeText(AsyncTaskActivity.this, "AsyncTask Map Location Completed", Toast.LENGTH_SHORT).show();
+        }
+    }
 
 }
